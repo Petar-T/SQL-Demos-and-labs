@@ -1,0 +1,515 @@
+// =============================================================================
+//  STEP 4 - AZURE SQL AUDITING: KQL DEMO WALKTHROUGH (Log Analytics)
+//  File: 04-Audit-KQL-Demo.kql
+//
+//  Where : Log Analytics workspace > Logs  (switch the editor to "KQL mode")
+//  Table : AzureDiagnostics | where Category == "SQLSecurityAuditEvents"
+//  How   : put the cursor INSIDE a block and press Shift+Enter.
+//          Blocks are separated by blank lines - Log Analytics runs only the block
+//          under the cursor, so every block is standalone (the "let AuditLog" header
+//          is repeated on purpose).
+//
+//  The standard header (let AuditLog = ...) normalises the audit columns once:
+//    * action_id_s is padded with spaces ("G  ", "DL  ") -> trim(" ", ...)
+//    * column_ifexists(): AzureDiagnostics only creates a column after a value
+//      has been ingested (e.g. response_rows_d appears only with BATCH_COMPLETED),
+//      so optional missing fields can be blank. A missing table still requires ingestion.
+//    * AzureDiagnostics has a 500-column limit per workspace; overflow fields land
+//      in the dynamic column AdditionalFields. These blocks read typed columns;
+//      inspect AdditionalFields separately if expected values have overflowed.
+//  Tip: save the header as a workspace FUNCTION (e.g. SqlAuditLog) for production.
+//
+//  Run 03-Generate-Audit-Activity.sql producer sections BEFORE their paired KQL.
+//  Order: producer -> ingestion -> matching KQL -> inspect actual expected evidence.
+//  A real NEW connection is required for authentication; T-SQL cannot create it.
+//  Portal defaults: BATCH_COMPLETED_GROUP, SUCCESSFUL_DATABASE_AUTHENTICATION_GROUP,
+//  FAILED_DATABASE_AUTHENTICATION_GROUP. Granular privilege/DDL action IDs below
+//  are handled if present, but are NOT guaranteed by these three groups.
+//  Core: 0, 1a/1b, 2, 3, 6-9. Optional hunts may correctly return no rows.
+//  DBAF exercises require optional SQL-password authentication, not failed Entra
+//  credentials (validated upstream; investigate those in Entra sign-in logs).
+//  This lab is Entra-only: skip SQL-password exercises unless separately approved.
+//  Statement-text matches are candidates, not parsed SQL or execution proof:
+//  comments/literals/failed attempts can match; quoting/dynamic SQL can be missed.
+//  Inspect full batches and result fields; batch success does not mean every
+//  statement succeeded (for example, a permission error caught by TRY/CATCH).
+//
+//  Action IDs used here:  DBAS/DBAF auth succeeded/failed, BCM batch completed,
+//  RCM RPC completed, APRL/DPRL add/drop role member, G/D/R grant/deny/revoke,
+//  IMP impersonate, CR/AL/DR create/alter/drop, AUSC audit session changed.
+//  Production toolkit (more hunting queries): AzureSQL-Observability/01-auditing/04-audit-hunting.kql
+// =============================================================================
+
+
+// -----------------------------------------------------------------------------
+// 0. INGESTION CHECK - is anything arriving?
+// WHAT  : event count, first/last event and ingestion delay per server/database.
+// RUN FIRST: SQL section 0 marker; use section 5 for the final freshness check.
+// SAY   : "A new diagnostic route can take up to 90 minutes to start delivery.
+//          Established resource logs usually take minutes; measure actual delay here."
+// EXPECT: rows only for databases with ingested activity; master is not required.
+//          No rows -> delivery not proved. Check scope/time range, wait for ingestion,
+//          then follow README checks without assuming a root cause.
+// -----------------------------------------------------------------------------
+AzureDiagnostics
+| where TimeGenerated > ago(24h)
+| where Category == "SQLSecurityAuditEvents"
+| extend IngestDelay = ingestion_time() - TimeGenerated,
+         ServerName   = tostring(column_ifexists("LogicalServerName_s", "")),
+         DatabaseName = tostring(column_ifexists("database_name_s", ""))
+| summarize Events = count(),
+            FirstEvent = min(TimeGenerated),
+            LastEvent = max(TimeGenerated),
+            AvgIngestDelaySec = round(avg(IngestDelay) / 1s, 0)
+         by ServerName, DatabaseName
+| extend MinutesSinceLastEvent = datetime_diff('minute', now(), LastEvent)
+| order by LastEvent desc
+
+
+// -----------------------------------------------------------------------------
+// 1a. SCHEMA - which audit columns do we have?
+// WHAT  : the audit-related columns in AzureDiagnostics (typed suffix _s/_d/_t/_g/_b).
+// SAY   : "Audit records are flattened into AzureDiagnostics. The suffix tells the type:
+//          _s string, _d number, _t datetime. Same fields as sys.fn_get_audit_file."
+// EXPECT: actual available columns; the count and optional row-count fields vary.
+// -----------------------------------------------------------------------------
+AzureDiagnostics
+| where TimeGenerated > ago(24h)
+| where Category == "SQLSecurityAuditEvents"
+| getschema
+| where ColumnName matches regex @"^(action_|server_principal|database_principal|target_|statement|client_ip|application_name|host_name|database_name|schema_name|object_name|class_type|succeeded|affected_rows|response_rows|duration_|session_id|event_time|sequence_|transaction_id|additional_information|LogicalServerName)"
+| project ColumnName, ColumnType
+
+
+// -----------------------------------------------------------------------------
+// 1b. PEEK - 10 raw audit records with the most useful columns.
+// SAY   : "Every record answers WHO (principal), WHAT (action + statement),
+//          WHEN, FROM WHERE (IP, application, host) and with WHAT RESULT."
+// EXPECT: actual authentication/completed-batch rows from the demo activity.
+// -----------------------------------------------------------------------------
+let AuditLog = AzureDiagnostics
+    | where Category == "SQLSecurityAuditEvents"
+    | extend ActionId     = trim(" ", tostring(column_ifexists("action_id_s", ""))),
+             ActionName   = tostring(column_ifexists("action_name_s", "")),
+             Succeeded    = tostring(column_ifexists("succeeded_s", "")),
+             Principal    = tostring(column_ifexists("server_principal_name_s", "")),
+             DbUser       = tostring(column_ifexists("database_principal_name_s", "")),
+             ClientIp     = tostring(column_ifexists("client_ip_s", "")),
+             Application  = tostring(column_ifexists("application_name_s", "")),
+             ServerName   = tostring(column_ifexists("LogicalServerName_s", "")),
+             DatabaseName = tostring(column_ifexists("database_name_s", "")),
+             Statement    = tostring(column_ifexists("statement_s", "")),
+             RowsReturned = tolong(column_ifexists("response_rows_d", real(null))),
+             RowsAffected = tolong(column_ifexists("affected_rows_d", real(null)));
+AuditLog
+| where TimeGenerated > ago(24h)
+| top 10 by TimeGenerated desc
+| project TimeGenerated, ServerName, DatabaseName, ActionId, ActionName, Succeeded,
+          Principal, DbUser, ClientIp, Application, RowsReturned, Statement
+
+
+// -----------------------------------------------------------------------------
+// 2. TIMELINE - events by action over time.
+// WHAT  : 5-minute buckets per action_name, rendered as a time chart.
+// SAY   : "This is the heartbeat of the database. Note how BATCH COMPLETED dominates
+//          volume with the default policy - measure rather than assume the cost."
+// EXPECT: completed-batch/authentication series for activity actually ingested.
+// -----------------------------------------------------------------------------
+let AuditLog = AzureDiagnostics
+    | where Category == "SQLSecurityAuditEvents"
+    | extend ActionId     = trim(" ", tostring(column_ifexists("action_id_s", ""))),
+             ActionName   = tostring(column_ifexists("action_name_s", "")),
+             Succeeded    = tostring(column_ifexists("succeeded_s", "")),
+             Principal    = tostring(column_ifexists("server_principal_name_s", "")),
+             DbUser       = tostring(column_ifexists("database_principal_name_s", "")),
+             ClientIp     = tostring(column_ifexists("client_ip_s", "")),
+             Application  = tostring(column_ifexists("application_name_s", "")),
+             ServerName   = tostring(column_ifexists("LogicalServerName_s", "")),
+             DatabaseName = tostring(column_ifexists("database_name_s", "")),
+             Statement    = tostring(column_ifexists("statement_s", "")),
+             RowsReturned = tolong(column_ifexists("response_rows_d", real(null))),
+             RowsAffected = tolong(column_ifexists("affected_rows_d", real(null)));
+AuditLog
+| where TimeGenerated > ago(4h)
+| extend Action = iff(isempty(ActionName), ActionId, ActionName)
+| summarize Events = count() by bin(TimeGenerated, 5m), Action
+| render timechart
+
+
+// -----------------------------------------------------------------------------
+// 3. LOGINS - success vs failure by client IP and application.
+// RUN FIRST: disconnect/reconnect AFTER auditing is on, then SQL section 1.
+//            A new query tab, SELECT marker or EXECUTE AS is not a new login.
+// WHAT  : DBAS (succeeded) / DBAF (failed) per source.
+// SAY   : "Authentication is included in the portal default. Investigate a source
+//          with many failures; client application names are context, not proof."
+// EXPECT: Entra SQL connection successes; failures only if they reached SQL.
+//          WITHOUT LOGIN impersonation is not authentication. See manual README steps.
+// -----------------------------------------------------------------------------
+let AuditLog = AzureDiagnostics
+    | where Category == "SQLSecurityAuditEvents"
+    | extend ActionId     = trim(" ", tostring(column_ifexists("action_id_s", ""))),
+             ActionName   = tostring(column_ifexists("action_name_s", "")),
+             Succeeded    = tostring(column_ifexists("succeeded_s", "")),
+             Principal    = tostring(column_ifexists("server_principal_name_s", "")),
+             DbUser       = tostring(column_ifexists("database_principal_name_s", "")),
+             ClientIp     = tostring(column_ifexists("client_ip_s", "")),
+             Application  = tostring(column_ifexists("application_name_s", "")),
+             ServerName   = tostring(column_ifexists("LogicalServerName_s", "")),
+             DatabaseName = tostring(column_ifexists("database_name_s", "")),
+             Statement    = tostring(column_ifexists("statement_s", "")),
+             RowsReturned = tolong(column_ifexists("response_rows_d", real(null))),
+             RowsAffected = tolong(column_ifexists("affected_rows_d", real(null)));
+AuditLog
+| where TimeGenerated > ago(24h)
+| where ActionId in ("DBAS", "DBAF")
+| summarize Succeeded  = countif(ActionId == "DBAS"),
+            Failed     = countif(ActionId == "DBAF"),
+            Principals = make_set(Principal, 10),
+            Databases  = make_set(DatabaseName, 10),
+            LastSeen   = max(TimeGenerated)
+         by ClientIp, Application
+| extend FailureRatePct = round(100.0 * Failed / (Succeeded + Failed), 1)
+| order by Failed desc, Succeeded desc
+
+
+// -----------------------------------------------------------------------------
+// 4. BRUTE FORCE - >= 10 failed logins from one IP within 5 minutes.
+// WHAT  : failed authentications bucketed in 5-minute windows per client IP.
+// SAY   : "Password guessing in its simplest form. This is exactly the logic we will
+//          turn into an optional alert through the portal."
+// EXPECT: rows only for >=10 real failures in one five-minute bin.
+//          A burst split across a bin boundary may not qualify. Keep the threshold;
+//          zero rows is valid, not a reason to lower it.
+// -----------------------------------------------------------------------------
+let AuditLog = AzureDiagnostics
+    | where Category == "SQLSecurityAuditEvents"
+    | extend ActionId     = trim(" ", tostring(column_ifexists("action_id_s", ""))),
+             ActionName   = tostring(column_ifexists("action_name_s", "")),
+             Succeeded    = tostring(column_ifexists("succeeded_s", "")),
+             Principal    = tostring(column_ifexists("server_principal_name_s", "")),
+             DbUser       = tostring(column_ifexists("database_principal_name_s", "")),
+             ClientIp     = tostring(column_ifexists("client_ip_s", "")),
+             Application  = tostring(column_ifexists("application_name_s", "")),
+             ServerName   = tostring(column_ifexists("LogicalServerName_s", "")),
+             DatabaseName = tostring(column_ifexists("database_name_s", "")),
+             Statement    = tostring(column_ifexists("statement_s", "")),
+             RowsReturned = tolong(column_ifexists("response_rows_d", real(null))),
+             RowsAffected = tolong(column_ifexists("affected_rows_d", real(null)));
+let Threshold = 10;
+AuditLog
+| where TimeGenerated > ago(24h)
+| where ActionId == "DBAF"
+| summarize Failures   = count(),
+            Principals = make_set(Principal, 20),
+            Apps       = make_set(Application, 10),
+            FirstSeen  = min(TimeGenerated),
+            LastSeen   = max(TimeGenerated)
+         by ClientIp, ServerName, Window = bin(TimeGenerated, 5m)
+| where Failures >= Threshold
+| extend BurstSeconds = datetime_diff('second', LastSeen, FirstSeen)
+| order by Failures desc
+
+
+// -----------------------------------------------------------------------------
+// 5. SUCCESS AFTER FAILURES - "the attacker got in".
+// WHAT  : IPs with >= 5 failed logins followed by a successful login from the SAME IP
+//          within 10 minutes of the last failure.
+// SAY   : "Failures correlated with a success are an investigation lead, not proof."
+// EXPECT: no rows unless the optional manual authentication exercise qualifies.
+//          Shared IPs and unrelated admin sessions can correlate. SamePrincipal
+//          is a tuning clue, not an assertion that the account was compromised.
+//          This query allows success from FirstFail onward, including during a burst.
+// -----------------------------------------------------------------------------
+let AuditLog = AzureDiagnostics
+    | where Category == "SQLSecurityAuditEvents"
+    | extend ActionId     = trim(" ", tostring(column_ifexists("action_id_s", ""))),
+             ActionName   = tostring(column_ifexists("action_name_s", "")),
+             Succeeded    = tostring(column_ifexists("succeeded_s", "")),
+             Principal    = tostring(column_ifexists("server_principal_name_s", "")),
+             DbUser       = tostring(column_ifexists("database_principal_name_s", "")),
+             ClientIp     = tostring(column_ifexists("client_ip_s", "")),
+             Application  = tostring(column_ifexists("application_name_s", "")),
+             ServerName   = tostring(column_ifexists("LogicalServerName_s", "")),
+             DatabaseName = tostring(column_ifexists("database_name_s", "")),
+             Statement    = tostring(column_ifexists("statement_s", "")),
+             RowsReturned = tolong(column_ifexists("response_rows_d", real(null))),
+             RowsAffected = tolong(column_ifexists("affected_rows_d", real(null)));
+let Lookback = 24h;
+let Fails = AuditLog
+    | where TimeGenerated > ago(Lookback)
+    | where ActionId == "DBAF"
+    | summarize FailCount = count(), FirstFail = min(TimeGenerated), LastFail = max(TimeGenerated),
+                FailedPrincipals = make_set(Principal, 20)
+             by ClientIp
+    | where FailCount >= 5;
+let Wins = AuditLog
+    | where TimeGenerated > ago(Lookback)
+    | where ActionId == "DBAS"
+    | project SuccessTime = TimeGenerated, ClientIp, SuccessPrincipal = Principal,
+              SuccessApp = Application, DatabaseName;
+Fails
+| join kind=inner Wins on ClientIp
+| where SuccessTime between (FirstFail .. (LastFail + 10m))
+| extend SamePrincipal = set_has_element(FailedPrincipals, SuccessPrincipal)
+| summarize FirstSuccess = min(SuccessTime), FailedPrincipals = take_any(FailedPrincipals)
+         by ClientIp, SuccessPrincipal, SuccessApp, DatabaseName, FailCount, FirstFail, LastFail, SamePrincipal
+| project-reorder FirstSuccess, SamePrincipal, SuccessPrincipal, ClientIp, FailCount
+| order by SamePrincipal desc, FirstSuccess asc
+
+
+// -----------------------------------------------------------------------------
+// 6. PRIVILEGE ESCALATION - role membership, permissions, impersonation, new users.
+// RUN FIRST: the ENTIRE SQL section 2, including REVERT and role removal.
+// WHAT  : APRL/DPRL, GRANT/DENY/REVOKE, IMPERSONATE, CREATE/ALTER/DROP USER or ROLE,
+//          password changes. HighRisk is a text/action hint, not confirmed escalation.
+// SAY   : "Here is the story in order: a user is created, granted SELECT, impersonated,
+//          and then temporarily added to db_owner."
+// EXPECT: relevant batch statement text under the portal defaults; separate
+//          CREATE/GRANT/IMP/APRL IDs are not guaranteed. Inspect actual fields.
+//          ALTER ROLE db_owner batches should have HighRisk = true, including removal.
+// -----------------------------------------------------------------------------
+let AuditLog = AzureDiagnostics
+    | where Category == "SQLSecurityAuditEvents"
+    | extend ActionId     = trim(" ", tostring(column_ifexists("action_id_s", ""))),
+             ActionName   = tostring(column_ifexists("action_name_s", "")),
+             Succeeded    = tostring(column_ifexists("succeeded_s", "")),
+             Principal    = tostring(column_ifexists("server_principal_name_s", "")),
+             DbUser       = tostring(column_ifexists("database_principal_name_s", "")),
+             ClientIp     = tostring(column_ifexists("client_ip_s", "")),
+             Application  = tostring(column_ifexists("application_name_s", "")),
+             ServerName   = tostring(column_ifexists("LogicalServerName_s", "")),
+             DatabaseName = tostring(column_ifexists("database_name_s", "")),
+             Statement    = tostring(column_ifexists("statement_s", "")),
+             RowsReturned = tolong(column_ifexists("response_rows_d", real(null))),
+             RowsAffected = tolong(column_ifexists("affected_rows_d", real(null)));
+let PrivilegedRoles = dynamic(["db_owner", "db_securityadmin", "db_accessadmin", "db_ddladmin"]);
+AuditLog
+| where TimeGenerated > ago(24h)
+| where ActionId in ("APRL", "DPRL", "G", "D", "R", "GWG", "IMP")
+     or (ActionId in ("CR", "AL", "DR") and Statement matches regex @"(?i)\b(USER|ROLE)\b")
+     or ActionName has "PASSWORD"
+     // Portal default: identify privilege-related activity in completed-batch text.
+     or (ActionId == "BCM" and Statement matches regex @"(?i)\b(ALTER\s+ROLE|GRANT|DENY|REVOKE|EXECUTE\s+AS|CREATE\s+USER|ALTER\s+USER|DROP\s+USER)\b")
+| extend TargetPrincipal = tostring(column_ifexists("target_database_principal_name_s", ""))
+| extend HighRisk = Statement has_any (PrivilegedRoles) or ActionId == "IMP"
+| project TimeGenerated, HighRisk, ActionId, ActionName, Principal, DbUser, TargetPrincipal,
+          DatabaseName, Statement, ClientIp, Application, Succeeded
+| order by TimeGenerated asc
+
+
+// -----------------------------------------------------------------------------
+// 7. DESTRUCTIVE DDL - DROP / TRUNCATE.
+// RUN FIRST: SQL section 3 creates, truncates and drops dbo.AuditDemo_Staging.
+// WHAT  : DROP events if emitted, and statement text containing DROP/TRUNCATE.
+// SAY   : "'Who dropped that table?' is the most common audit question after an outage.
+//          Batch text is useful even when a granular DDL record is not emitted."
+// EXPECT: completed batches mentioning TRUNCATE/DROP dbo.AuditDemo_Staging.
+//          ObjectName may be blank; a matching statement can also be an attempt.
+// -----------------------------------------------------------------------------
+let AuditLog = AzureDiagnostics
+    | where Category == "SQLSecurityAuditEvents"
+    | extend ActionId     = trim(" ", tostring(column_ifexists("action_id_s", ""))),
+             ActionName   = tostring(column_ifexists("action_name_s", "")),
+             Succeeded    = tostring(column_ifexists("succeeded_s", "")),
+             Principal    = tostring(column_ifexists("server_principal_name_s", "")),
+             DbUser       = tostring(column_ifexists("database_principal_name_s", "")),
+             ClientIp     = tostring(column_ifexists("client_ip_s", "")),
+             Application  = tostring(column_ifexists("application_name_s", "")),
+             ServerName   = tostring(column_ifexists("LogicalServerName_s", "")),
+             DatabaseName = tostring(column_ifexists("database_name_s", "")),
+             Statement    = tostring(column_ifexists("statement_s", "")),
+             RowsReturned = tolong(column_ifexists("response_rows_d", real(null))),
+             RowsAffected = tolong(column_ifexists("affected_rows_d", real(null)));
+AuditLog
+| where TimeGenerated > ago(24h)
+| where ActionId == "DR"
+     or Statement matches regex @"(?i)\b(DROP|TRUNCATE)\s+(TABLE|VIEW|PROCEDURE|PROC|FUNCTION|SCHEMA|INDEX|USER|ROLE)\b"
+| extend ObjectName = strcat(tostring(column_ifexists("schema_name_s", "")), ".",
+                             tostring(column_ifexists("object_name_s", "")))
+| project TimeGenerated, ActionId, ActionName, Principal, DbUser, DatabaseName, ObjectName,
+          Statement, ClientIp, Application, Succeeded
+| order by TimeGenerated desc
+
+
+// -----------------------------------------------------------------------------
+// 8. SENSITIVE DATA ACCESS - who touched SalesLT.Customer (e-mail / phone = PII)?
+// RUN FIRST: SQL section 4 customer SELECT and larger CROSS JOIN.
+// WHAT  : batches that reference the table, with rows returned / affected.
+// SAY   : "THIS is the question compliance asks: who read personal data, how much,
+//          from where? BATCH_COMPLETED_GROUP is included in the portal default."
+// EXPECT: matching completed batches, available principal/row-count fields and
+//          the CROSS JOIN. Sample counts vary; multi-statement batch counts may
+//          be aggregated. BulkRead is true only when emitted RowsReturned >= 10000.
+//          Missing row counts leave BulkRead unknown, not false.
+//          PIITextHint checks column names or '*'; this can match comments,
+//          literals or multiplication and is not proof of reading PII.
+// -----------------------------------------------------------------------------
+let AuditLog = AzureDiagnostics
+    | where Category == "SQLSecurityAuditEvents"
+    | extend ActionId     = trim(" ", tostring(column_ifexists("action_id_s", ""))),
+             ActionName   = tostring(column_ifexists("action_name_s", "")),
+             Succeeded    = tostring(column_ifexists("succeeded_s", "")),
+             Principal    = tostring(column_ifexists("server_principal_name_s", "")),
+             DbUser       = tostring(column_ifexists("database_principal_name_s", "")),
+             ClientIp     = tostring(column_ifexists("client_ip_s", "")),
+             Application  = tostring(column_ifexists("application_name_s", "")),
+             ServerName   = tostring(column_ifexists("LogicalServerName_s", "")),
+             DatabaseName = tostring(column_ifexists("database_name_s", "")),
+             Statement    = tostring(column_ifexists("statement_s", "")),
+             RowsReturned = tolong(column_ifexists("response_rows_d", real(null))),
+             RowsAffected = tolong(column_ifexists("affected_rows_d", real(null)));
+let SensitiveTable   = "SalesLT.Customer";
+let SensitiveColumns = dynamic(["EmailAddress", "Phone"]);
+let BulkThreshold    = 10000;
+AuditLog
+| where TimeGenerated > ago(24h)
+| where ActionId in ("BCM", "RCM")
+| where Statement contains SensitiveTable
+| extend PIITextHint = Statement has_any (SensitiveColumns) or Statement contains "*",
+         BulkRead   = iff(isnull(RowsReturned), bool(null), RowsReturned >= BulkThreshold)
+| project TimeGenerated, Principal, DbUser, ClientIp, Application, Succeeded,
+          RowsReturned, RowsAffected, PIITextHint, BulkRead,
+          Statement = substring(Statement, 0, 300)
+| order by TimeGenerated asc
+
+
+// -----------------------------------------------------------------------------
+// 9. VOLUME & COST - top principals / applications / actions by audit volume.
+// RUN FIRST: SQL sections 0-4; then allow their records to be ingested.
+// WHAT  : event count and billed size (_BilledSize) per action, principal and app.
+// SAY   : "Auditing is not free: you pay per GB ingested. BATCH COMPLETED from one chatty
+//          application can dominate volume. Measure actual events and billed size."
+// EXPECT: actual action/principal/application distribution, not a fixed percentage.
+// -----------------------------------------------------------------------------
+let AuditLog = AzureDiagnostics
+    | where Category == "SQLSecurityAuditEvents"
+    | extend ActionId     = trim(" ", tostring(column_ifexists("action_id_s", ""))),
+             ActionName   = tostring(column_ifexists("action_name_s", "")),
+             Succeeded    = tostring(column_ifexists("succeeded_s", "")),
+             Principal    = tostring(column_ifexists("server_principal_name_s", "")),
+             DbUser       = tostring(column_ifexists("database_principal_name_s", "")),
+             ClientIp     = tostring(column_ifexists("client_ip_s", "")),
+             Application  = tostring(column_ifexists("application_name_s", "")),
+             ServerName   = tostring(column_ifexists("LogicalServerName_s", "")),
+             DatabaseName = tostring(column_ifexists("database_name_s", "")),
+             Statement    = tostring(column_ifexists("statement_s", "")),
+             RowsReturned = tolong(column_ifexists("response_rows_d", real(null))),
+             RowsAffected = tolong(column_ifexists("affected_rows_d", real(null)));
+let Window = 24h;
+let TotalEvents = toscalar(AuditLog | where TimeGenerated > ago(Window) | count);
+AuditLog
+| where TimeGenerated > ago(Window)
+| summarize Events = count(), BilledKB = round(sum(_BilledSize) / 1024.0, 1)
+         by Action = iff(isempty(ActionName), ActionId, ActionName), Principal, Application
+| extend PctOfEvents = round(100.0 * Events / TotalEvents, 1)
+| order by Events desc
+| take 20
+
+
+// -----------------------------------------------------------------------------
+// 10. NEW CLIENT IP - principal seen from an IP not in its 30-day baseline.
+// RUN FIRST: actual client activity from SQL sections 1-4; a known IP can yield no rows.
+// WHAT  : (principal, client IP) pairs from the last 24h that never occurred in the
+//          previous 30 days (excluding the last day).
+// SAY   : "Baselines beat static rules. A service account suddenly connecting from a new
+//          IP is worth a look. In a brand-new lab everything is 'new' - in production
+//          this list is short."
+// EXPECT: fresh lab - every principal/IP pair (no baseline yet). Production - few rows.
+// -----------------------------------------------------------------------------
+let AuditLog = AzureDiagnostics
+    | where Category == "SQLSecurityAuditEvents"
+    | extend ActionId     = trim(" ", tostring(column_ifexists("action_id_s", ""))),
+             ActionName   = tostring(column_ifexists("action_name_s", "")),
+             Succeeded    = tostring(column_ifexists("succeeded_s", "")),
+             Principal    = tostring(column_ifexists("server_principal_name_s", "")),
+             DbUser       = tostring(column_ifexists("database_principal_name_s", "")),
+             ClientIp     = tostring(column_ifexists("client_ip_s", "")),
+             Application  = tostring(column_ifexists("application_name_s", "")),
+             ServerName   = tostring(column_ifexists("LogicalServerName_s", "")),
+             DatabaseName = tostring(column_ifexists("database_name_s", "")),
+             Statement    = tostring(column_ifexists("statement_s", "")),
+             RowsReturned = tolong(column_ifexists("response_rows_d", real(null))),
+             RowsAffected = tolong(column_ifexists("affected_rows_d", real(null)));
+let Baseline = AuditLog
+    | where TimeGenerated between (ago(30d) .. ago(1d))
+    | where isnotempty(ClientIp) and isnotempty(Principal)
+    | distinct Principal, ClientIp;
+AuditLog
+| where TimeGenerated > ago(1d)
+| where isnotempty(ClientIp) and isnotempty(Principal)
+| summarize Events    = count(),
+            FirstSeen = min(TimeGenerated),
+            Actions   = make_set(ActionName, 10),
+            Apps      = make_set(Application, 5)
+         by Principal, ClientIp
+| join kind=leftanti Baseline on Principal, ClientIp
+| order by FirstSeen asc
+
+
+// -----------------------------------------------------------------------------
+// 11a. AUDIT CONFIGURATION CHANGES - AUSC (audit session changed).
+// WHAT  : records written when the audit policy starts or changes.
+// SAY   : "Inspect audit configuration signals if emitted; also inspect the
+//          server's Azure Activity log for control-plane changes."
+// EXPECT: AUSC only if present. Empty under the default policy is possible;
+//          do not disable auditing just to force an event.
+// -----------------------------------------------------------------------------
+let AuditLog = AzureDiagnostics
+    | where Category == "SQLSecurityAuditEvents"
+    | extend ActionId     = trim(" ", tostring(column_ifexists("action_id_s", ""))),
+             ActionName   = tostring(column_ifexists("action_name_s", "")),
+             Succeeded    = tostring(column_ifexists("succeeded_s", "")),
+             Principal    = tostring(column_ifexists("server_principal_name_s", "")),
+             DbUser       = tostring(column_ifexists("database_principal_name_s", "")),
+             ClientIp     = tostring(column_ifexists("client_ip_s", "")),
+             Application  = tostring(column_ifexists("application_name_s", "")),
+             ServerName   = tostring(column_ifexists("LogicalServerName_s", "")),
+             DatabaseName = tostring(column_ifexists("database_name_s", "")),
+             Statement    = tostring(column_ifexists("statement_s", "")),
+             RowsReturned = tolong(column_ifexists("response_rows_d", real(null))),
+             RowsAffected = tolong(column_ifexists("affected_rows_d", real(null)));
+AuditLog
+| where TimeGenerated > ago(7d)
+| where ActionId == "AUSC"
+| extend AdditionalInfo = tostring(column_ifexists("additional_information_s", ""))
+| project TimeGenerated, ServerName, DatabaseName, ActionName, Principal, AdditionalInfo, Statement
+| order by TimeGenerated desc
+
+
+// -----------------------------------------------------------------------------
+// 11b. AUDIT PIPELINE HEALTH - silence detection per server.
+// RUN FIRST: SQL section 5 final marker; confirm its arrival with block 0/1b.
+// WHAT  : minutes since the last audit record per server over the last 7 days.
+// SAY   : "The scariest audit failure is a silent one - e.g. someone deleted the
+//          SQLSecurityAuditEvents diagnostic setting on master. Alert on silence."
+// EXPECT: Status = OK for the demo server; SILENT if no record for > 60 min
+//          (note: a paused serverless DB with no activity is also silent).
+//          A server with zero records in the lookback is ABSENT, not marked SILENT.
+//          This query alone cannot detect a never-ingested server; use block 0.
+// -----------------------------------------------------------------------------
+AzureDiagnostics
+| where TimeGenerated > ago(7d)
+| where Category == "SQLSecurityAuditEvents"
+| summarize LastEvent = max(TimeGenerated), Events7d = count() by ServerName = LogicalServerName_s
+| extend MinutesSinceLastEvent = datetime_diff('minute', now(), LastEvent)
+| extend Status = iff(MinutesSinceLastEvent > 60, "SILENT", "OK")
+| order by MinutesSinceLastEvent desc
+
+
+// -----------------------------------------------------------------------------
+// 12. ALERT-READY - failed-login burst (returns rows ONLY when the condition is met).
+// WHAT  : >= 10 DBAF from one IP in the last 5 minutes.
+//          Create the optional portal alert with "number of table rows > 0",
+//          evaluated every 5 min. Keep the actual threshold and predicates.
+// SAY   : "An alert is just a saved query plus a schedule plus an action group."
+// EXPECT: 0 rows unless a real qualifying burst is ingested inside the event-time
+//          window. Delayed ingestion can miss that window; deliberately document
+//          any production lookback change, not a tweak to manufacture demo success.
+// -----------------------------------------------------------------------------
+AzureDiagnostics
+| where TimeGenerated > ago(5m)
+| where Category == 'SQLSecurityAuditEvents'
+| where trim(' ', action_id_s) == 'DBAF'
+| summarize Failures = count(), Principals = make_set(server_principal_name_s, 20), Apps = make_set(application_name_s, 10), FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated) by ClientIp = client_ip_s, ServerName = LogicalServerName_s
+| where Failures >= 10

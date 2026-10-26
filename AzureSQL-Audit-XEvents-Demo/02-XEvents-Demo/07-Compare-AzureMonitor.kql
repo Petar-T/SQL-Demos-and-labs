@@ -1,0 +1,60 @@
+// =============================================================================
+//  XEvents DEMO - OPTIONAL : COMPARE WITH AZURE MONITOR (Log Analytics)
+//  File : 07-Compare-AzureMonitor.kql
+//  Run  : Azure portal > Log Analytics workspace > Logs   (or the database's
+//         Monitoring > Logs blade)
+//
+//  PREREQUISITE
+//    A Diagnostic setting on the DATABASE (SQL database > Monitoring >
+//    Diagnostic settings - not on the logical server) that sends the categories
+//      Errors, Deadlocks, Blocks, Timeouts
+//    to a Log Analytics workspace (AzureDiagnostics table).
+//    Enable it BEFORE running the scenarios; ingestion latency is typically
+//    several minutes.
+//
+//  SAY  "Azure Monitor gives you the platform view with zero T-SQL: counts,
+//        trends, alerts across the whole estate. XEvents gives you the deep
+//        dive: exact statement, app, host, full deadlock graph, histogram.
+//        Use both: Azure Monitor to detect, XE to explain."
+//  EXPECT Only platform records actually emitted and ingested. Deliberate user
+//         errors, short blocking and client cancels do not guarantee matching
+//         Errors/Blocks/Timeouts records. XE attention is not equivalent to the
+//         platform Timeouts category. Empty categories are valid observations.
+// =============================================================================
+
+
+// --- 1. Counts per category and database, last 2 hours ----------------------
+let lookback = 2h;
+AzureDiagnostics
+| where TimeGenerated > ago(lookback)
+| where Category in ("Errors", "Deadlocks", "Blocks", "Timeouts")
+| summarize Events = count(), FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated)
+    by Category, LogicalServerName_s, DatabaseName_s
+| order by Events desc
+
+
+// --- 2. Same signal over time (5-minute bins) - render as a chart ----------
+let lookback = 2h;
+AzureDiagnostics
+| where TimeGenerated > ago(lookback)
+| where Category in ("Errors", "Deadlocks", "Blocks", "Timeouts")
+| summarize Events = count() by Category, bin(TimeGenerated, 5m)
+| render timechart
+
+
+// --- 3. Per resource (useful when several databases share a workspace) -----
+let lookback = 24h;
+AzureDiagnostics
+| where TimeGenerated > ago(lookback)
+| where Category in ("Errors", "Deadlocks", "Blocks", "Timeouts")
+| summarize Events = count() by Resource, DatabaseName_s, Category
+| order by Resource asc, Category asc
+
+
+// --- 4. Explore the detail columns yourself ---------------------------------
+// Column names for the detail fields differ per category; look at a few rows
+// rather than guessing (e.g. the Deadlocks category carries the deadlock XML).
+AzureDiagnostics
+| where TimeGenerated > ago(2h)
+| where Category == "Deadlocks"
+| take 5
