@@ -1,0 +1,81 @@
+let TargetDatabase = "sqldb-auditdemo";
+let TargetServer = "sql-auditdemo-petartr-1026";
+let RunStartUtc = datetime(2026-10-26T21:07:03Z);
+AzureDiagnostics
+| where TimeGenerated between (RunStartUtc .. now())
+| where Category == "SQLSecurityAuditEvents"
+| where tostring(column_ifexists("database_name_s", "")) == TargetDatabase
+| where tostring(column_ifexists("LogicalServerName_s", "")) =~ TargetServer
+| extend ActionId=trim(@"\s+", tostring(column_ifexists("action_id_s", ""))),
+         ActionName=tostring(column_ifexists("action_name_s", "")),
+         Statement=tostring(column_ifexists("statement_s", "")),
+         ObjectName=tostring(column_ifexists("object_name_s", ""))
+| where Statement contains "ExpAudit" or ObjectName startswith "ExpAudit"
+| summarize Events=count(), First=min(TimeGenerated), Last=max(TimeGenerated) by ActionId, ActionName
+| order by Last desc
+
+let TargetDatabase = "sqldb-auditdemo";
+let TargetServer = "sql-auditdemo-petartr-1026";
+let RunStartUtc = datetime(2026-10-26T21:07:03Z);
+AzureDiagnostics
+| where TimeGenerated between (RunStartUtc .. now())
+| where Category == "SQLSecurityAuditEvents"
+| where tostring(column_ifexists("database_name_s", "")) == TargetDatabase
+| where tostring(column_ifexists("LogicalServerName_s", "")) =~ TargetServer
+| extend ActionId=trim(@"\s+", tostring(column_ifexists("action_id_s", ""))),
+         ObjectName=tostring(column_ifexists("object_name_s", "")),
+         Statement=tostring(column_ifexists("statement_s", ""))
+| where ObjectName == "ExpAudit_TableLifecycle" or Statement contains "ExpAudit_TableLifecycle"
+| where ActionId in ("CR", "AL", "DR", "BCM")
+| extend Evidence=iff(ActionId == "BCM", "Batch text (not granular)", "Granular schema-object event")
+| project TimeGenerated, Evidence, ActionId,
+          Principal=tostring(column_ifexists("server_principal_name_s", "")),
+          Succeeded=tostring(column_ifexists("succeeded_s", "")), ObjectName, Statement
+| order by TimeGenerated asc
+
+let TargetDatabase = "sqldb-auditdemo";
+let TargetServer = "sql-auditdemo-petartr-1026";
+let RunStartUtc = datetime(2026-10-26T21:07:03Z);
+AzureDiagnostics
+| where TimeGenerated between (RunStartUtc .. now())
+| where Category == "SQLSecurityAuditEvents"
+| where tostring(column_ifexists("database_name_s", "")) == TargetDatabase
+| where tostring(column_ifexists("LogicalServerName_s", "")) =~ TargetServer
+| extend ActionId=trim(@"\s+", tostring(column_ifexists("action_id_s", ""))),
+         ObjectName=tostring(column_ifexists("object_name_s", "")),
+         Statement=tostring(column_ifexists("statement_s", ""))
+| where ObjectName == "ExpAudit_DataRemoval" or Statement contains "ExpAudit_DataRemoval"
+| extend IsDelete=Statement matches regex @"(?im)^\s*DELETE\s+FROM\s+dbo\.ExpAudit_DataRemoval\b",
+         IsTruncate=Statement matches regex @"(?im)^\s*TRUNCATE\s+TABLE\s+dbo\.ExpAudit_DataRemoval\b"
+| extend Operation=case(
+    ActionId == "DL" and IsTruncate, "TRUNCATE - granular access event (DL)",
+    ActionId == "DL" and IsDelete, "DELETE - granular access event",
+    ActionId == "DL", "DL access event - inspect statement",
+    ActionId == "BCM" and IsDelete, "DELETE - completed batch",
+    ActionId == "BCM" and IsTruncate, "TRUNCATE - completed batch",
+    "")
+| where isnotempty(Operation)
+| project TimeGenerated, Operation, ActionId,
+          Principal=tostring(column_ifexists("server_principal_name_s", "")),
+          Succeeded=tostring(column_ifexists("succeeded_s", "")),
+          AffectedRows=tolong(column_ifexists("affected_rows_d", real(null))), Statement
+| order by TimeGenerated asc
+
+let TargetDatabase = "sqldb-auditdemo";
+let TargetServer = "sql-auditdemo-petartr-1026";
+let RunStartUtc = datetime(2026-10-26T21:07:03Z);
+AzureDiagnostics
+| where TimeGenerated between (RunStartUtc .. now())
+| where Category == "SQLSecurityAuditEvents"
+| where tostring(column_ifexists("database_name_s", "")) == TargetDatabase
+| where tostring(column_ifexists("LogicalServerName_s", "")) =~ TargetServer
+| extend ActionId=trim(@"\s+", tostring(column_ifexists("action_id_s", ""))),
+         TargetUser=tostring(column_ifexists("target_database_principal_name_s", "")),
+         Statement=tostring(column_ifexists("statement_s", ""))
+| where TargetUser == "ExpAudit_User" or Statement contains "ExpAudit_User"
+| where ActionId in ("CR", "AL", "DR", "BCM")
+| extend Evidence=iff(ActionId == "BCM", "Batch text (not granular)", "Granular principal-change event")
+| project TimeGenerated, Evidence, ActionId,
+          Principal=tostring(column_ifexists("server_principal_name_s", "")),
+          TargetUser, Succeeded=tostring(column_ifexists("succeeded_s", "")), Statement
+| order by TimeGenerated asc

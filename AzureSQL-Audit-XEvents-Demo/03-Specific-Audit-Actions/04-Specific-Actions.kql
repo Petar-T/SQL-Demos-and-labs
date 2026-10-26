@@ -1,0 +1,98 @@
+// NEW DEMO. Run 01 (expand), 02 (verify), then 03 (SQL) BEFORE these queries.
+// In EACH block replace the database/server and UTC start with YOUR SQL run.
+// Use the workspace passed to 01/02. Full server name here excludes .database.windows.net.
+// First diagnostic delivery may take up to 90 minutes; established delivery usually minutes.
+// No fabricated records or lower thresholds: absent native rows mean native capture is not yet proved.
+// IDs can contain multiple padding spaces (e.g. "DL  "); trim the entire whitespace run.
+
+// 0. Delivery inventory: check fresh marker and actual action IDs first.
+let TargetDatabase = "sqldb-auditdemo";
+let TargetServer = "<your-sql-server>";
+let RunStartUtc = datetime(2026-10-26T00:00:00Z);
+AzureDiagnostics
+| where TimeGenerated between (RunStartUtc .. now())
+| where Category == "SQLSecurityAuditEvents"
+| where tostring(column_ifexists("database_name_s", "")) == TargetDatabase
+| where tostring(column_ifexists("LogicalServerName_s", "")) =~ TargetServer
+| extend ActionId=trim(@"\s+", tostring(column_ifexists("action_id_s", ""))),
+         ActionName=tostring(column_ifexists("action_name_s", "")),
+         Statement=tostring(column_ifexists("statement_s", "")),
+         ObjectName=tostring(column_ifexists("object_name_s", ""))
+| where Statement contains "ExpAudit" or ObjectName startswith "ExpAudit"
+| summarize Events=count(), First=min(TimeGenerated), Last=max(TimeGenerated) by ActionId, ActionName
+| order by Last desc
+
+// 1. TABLE CREATE / ALTER / DROP.
+// Producer A -> expect CR/AL/DR for the specific table. BCM is shown but NOT passed off as granular proof.
+let TargetDatabase = "sqldb-auditdemo";
+let TargetServer = "<your-sql-server>";
+let RunStartUtc = datetime(2026-10-26T00:00:00Z);
+AzureDiagnostics
+| where TimeGenerated between (RunStartUtc .. now())
+| where Category == "SQLSecurityAuditEvents"
+| where tostring(column_ifexists("database_name_s", "")) == TargetDatabase
+| where tostring(column_ifexists("LogicalServerName_s", "")) =~ TargetServer
+| extend ActionId=trim(@"\s+", tostring(column_ifexists("action_id_s", ""))),
+         ObjectName=tostring(column_ifexists("object_name_s", "")),
+         Statement=tostring(column_ifexists("statement_s", ""))
+| where ObjectName == "ExpAudit_TableLifecycle" or Statement contains "ExpAudit_TableLifecycle"
+| where ActionId in ("CR", "AL", "DR", "BCM")
+| extend Evidence=iff(ActionId == "BCM", "Batch text (not granular)", "Granular schema-object event")
+| project TimeGenerated, Evidence, ActionId,
+          Principal=tostring(column_ifexists("server_principal_name_s", "")),
+          Succeeded=tostring(column_ifexists("succeeded_s", "")), ObjectName, Statement
+| order by TimeGenerated asc
+
+// 2. DELETE versus TRUNCATE.
+// Producer B -> inspect both action ID AND statement: this tested engine emitted
+// DL for DELETE and TRUNCATE. Do not label every DL record as a DELETE statement.
+// Native TRUNCATE behavior can vary; completed-batch evidence is retained separately.
+let TargetDatabase = "sqldb-auditdemo";
+let TargetServer = "<your-sql-server>";
+let RunStartUtc = datetime(2026-10-26T00:00:00Z);
+AzureDiagnostics
+| where TimeGenerated between (RunStartUtc .. now())
+| where Category == "SQLSecurityAuditEvents"
+| where tostring(column_ifexists("database_name_s", "")) == TargetDatabase
+| where tostring(column_ifexists("LogicalServerName_s", "")) =~ TargetServer
+| extend ActionId=trim(@"\s+", tostring(column_ifexists("action_id_s", ""))),
+         ObjectName=tostring(column_ifexists("object_name_s", "")),
+         Statement=tostring(column_ifexists("statement_s", ""))
+| where ObjectName == "ExpAudit_DataRemoval" or Statement contains "ExpAudit_DataRemoval"
+| extend IsDelete=Statement matches regex @"(?im)^\s*DELETE\s+FROM\s+dbo\.ExpAudit_DataRemoval\b",
+         IsTruncate=Statement matches regex @"(?im)^\s*TRUNCATE\s+TABLE\s+dbo\.ExpAudit_DataRemoval\b"
+| extend Operation=case(
+    ActionId == "DL" and IsTruncate, "TRUNCATE - granular access event (DL)",
+    ActionId == "DL" and IsDelete, "DELETE - granular access event",
+    ActionId == "DL", "DL access event - inspect statement",
+    ActionId == "BCM" and IsDelete, "DELETE - completed batch",
+    ActionId == "BCM" and IsTruncate, "TRUNCATE - completed batch",
+    "")
+| where isnotempty(Operation)
+| project TimeGenerated, Operation, ActionId,
+          Principal=tostring(column_ifexists("server_principal_name_s", "")),
+          Succeeded=tostring(column_ifexists("succeeded_s", "")),
+          AffectedRows=tolong(column_ifexists("affected_rows_d", real(null))), Statement
+| order by TimeGenerated asc
+
+// 3. USER CREATE / ALTER / DROP.
+// Producer C -> require the dedicated user name and actual CR/AL/DR event IDs.
+// These are principal-change records, not authentication/logins.
+let TargetDatabase = "sqldb-auditdemo";
+let TargetServer = "<your-sql-server>";
+let RunStartUtc = datetime(2026-10-26T00:00:00Z);
+AzureDiagnostics
+| where TimeGenerated between (RunStartUtc .. now())
+| where Category == "SQLSecurityAuditEvents"
+| where tostring(column_ifexists("database_name_s", "")) == TargetDatabase
+| where tostring(column_ifexists("LogicalServerName_s", "")) =~ TargetServer
+| extend ActionId=trim(@"\s+", tostring(column_ifexists("action_id_s", ""))),
+         TargetUser=tostring(column_ifexists("target_database_principal_name_s", "")),
+         Statement=tostring(column_ifexists("statement_s", ""))
+| where TargetUser == "ExpAudit_User" or Statement contains "ExpAudit_User"
+| where ActionId in ("CR", "AL", "DR", "BCM")
+| extend Evidence=iff(ActionId == "BCM", "Batch text (not granular)", "Granular principal-change event")
+| project TimeGenerated, Evidence, ActionId,
+          Principal=tostring(column_ifexists("server_principal_name_s", "")),
+          TargetUser, Succeeded=tostring(column_ifexists("succeeded_s", "")), Statement
+| order by TimeGenerated asc
