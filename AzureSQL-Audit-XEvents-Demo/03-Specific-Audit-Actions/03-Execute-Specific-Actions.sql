@@ -15,7 +15,7 @@
   or text match alone does not prove that every statement committed.
 */
 SET NOCOUNT ON;
-DECLARE @ExpectedDatabase sysname = N'sqldb-auditdemo';
+DECLARE @ExpectedDatabase sysname = N'YOUR_DEMO_DATABASE';
 IF DB_NAME() <> @ExpectedDatabase OR DB_NAME() IN (N'master', N'tempdb')
    OR @@TRANCOUNT <> 0
    OR OBJECT_ID(N'dbo.ExpAudit_TableLifecycle') IS NOT NULL

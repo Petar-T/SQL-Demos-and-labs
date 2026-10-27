@@ -6,9 +6,9 @@
 // IDs can contain multiple padding spaces (e.g. "DL  "); trim the entire whitespace run.
 
 // 0. Delivery inventory: check fresh marker and actual action IDs first.
-let TargetDatabase = "sqldb-auditdemo";
+let TargetDatabase = "<your-demo-database>";
 let TargetServer = "<your-sql-server>";
-let RunStartUtc = datetime(2026-10-26T00:00:00Z);
+let RunStartUtc = datetime(<run-start-utc>);
 AzureDiagnostics
 | where TimeGenerated between (RunStartUtc .. now())
 | where Category == "SQLSecurityAuditEvents"
@@ -24,9 +24,9 @@ AzureDiagnostics
 
 // 1. TABLE CREATE / ALTER / DROP.
 // Producer A -> expect CR/AL/DR for the specific table. BCM is shown but NOT passed off as granular proof.
-let TargetDatabase = "sqldb-auditdemo";
+let TargetDatabase = "<your-demo-database>";
 let TargetServer = "<your-sql-server>";
-let RunStartUtc = datetime(2026-10-26T00:00:00Z);
+let RunStartUtc = datetime(<run-start-utc>);
 AzureDiagnostics
 | where TimeGenerated between (RunStartUtc .. now())
 | where Category == "SQLSecurityAuditEvents"
@@ -47,9 +47,9 @@ AzureDiagnostics
 // Producer B -> inspect both action ID AND statement: this tested engine emitted
 // DL for DELETE and TRUNCATE. Do not label every DL record as a DELETE statement.
 // Native TRUNCATE behavior can vary; completed-batch evidence is retained separately.
-let TargetDatabase = "sqldb-auditdemo";
+let TargetDatabase = "<your-demo-database>";
 let TargetServer = "<your-sql-server>";
-let RunStartUtc = datetime(2026-10-26T00:00:00Z);
+let RunStartUtc = datetime(<run-start-utc>);
 AzureDiagnostics
 | where TimeGenerated between (RunStartUtc .. now())
 | where Category == "SQLSecurityAuditEvents"
@@ -78,9 +78,9 @@ AzureDiagnostics
 // 3. USER CREATE / ALTER / DROP.
 // Producer C -> require the dedicated user name and actual CR/AL/DR event IDs.
 // These are principal-change records, not authentication/logins.
-let TargetDatabase = "sqldb-auditdemo";
+let TargetDatabase = "<your-demo-database>";
 let TargetServer = "<your-sql-server>";
-let RunStartUtc = datetime(2026-10-26T00:00:00Z);
+let RunStartUtc = datetime(<run-start-utc>);
 AzureDiagnostics
 | where TimeGenerated between (RunStartUtc .. now())
 | where Category == "SQLSecurityAuditEvents"
